@@ -1,4 +1,4 @@
-package algorithm.bigclam
+package com.baidu.yundata.kg.algorithm.bigclam
 
 
 
@@ -17,10 +17,17 @@ import org.apache.spark.broadcast.Broadcast
 import com.clearspring.analytics.hash.MurmurHash
 import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession}
 import org.apache.hadoop.fs.Path
+import scala.collection.{immutable, mutable}
 
 
 
-class BigClam extends org.apache.spark.internal.Logging with Serializable {
+
+
+class BigClamPregel extends org.apache.spark.internal.Logging with Serializable {
+def MIN_P_ = 0.0001
+def MAX_P_ = 0.9999
+def MIN_F_ = 0.0
+def MAX_F_ = 1000.0 
 
 def loglikelihood(F:DataFrame,sumF:breeze.linalg.DenseMatrix[Double],alledges:DataFrame,kvalue:Int,spark: SparkSession):Double ={
     import spark.implicits._
@@ -47,140 +54,138 @@ def loglikelihood(F:DataFrame,sumF:breeze.linalg.DenseMatrix[Double],alledges:Da
  
 def loglikelihood(F:DataFrame,sumF:breeze.linalg.DenseMatrix[Double],edgerdd:RDD[(Long,Long)],kvalue:Int,spark: SparkSession):Double ={
       import spark.implicits._
-      //make (node,nodevector,Array[neighvector]) to make LLH compute easily
+      //构造(node,nodevector,Array[neighvector])
       val outedges=edgerdd.map(e => (e._1,e._2))
       val inedges=edgerdd.map(e => (e._2,e._1))
       val alledges=outedges.union(inedges).toDF("node","tonode")
       loglikelihood(F,sumF,alledges,kvalue,spark)
 }
 
-
-
 def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Long,Long)],S:Array[Long],uset:List[Long],spark: SparkSession):(DataFrame,Double)=
 {
     import spark.implicits._
     val sc=spark.sparkContext 
-    var F=n2c
+   
+ 
+    var F=n2c.rdd.map(r=>(r.getLong(0),r.getAs[Vector](1)))
     
-    var sumF=F.rdd.map(x=>(x.getLong(0),x.getAs[Vector](1))).map(x=>{
-        var fu = BDM.create(1,kvalue,x._2.toArray);
-        fu
-    }).reduce(_+_)
+    val edges=trainrdd.map(e => Edge(e._1,e._2, 1L))
+    val defaultvalue=""
+    val G=Graph.fromEdges(edges,defaultvalue)
     
-    val MIN_P_ = 0.0001
-    val MAX_P_ = 0.9999
-    val MIN_F_ = 0.0
-    val MAX_F_ = 1000.0
+    var alpha = 0.05
+    var beta = 0.1
+    var MaxIter =15
+    //var oldFuT = BDM.create(kvalue,1,fu.data)
+    var stepSize: Double = 1.0
+    var listSearch: List[Double] = List(1.0)
+    for(i <- 1 to MaxIter) {
+      stepSize *=beta
+      listSearch = stepSize::listSearch
+    }
+    def step(Fu:BDM[Double], stepSize:Double, direction:BDM[Double]):BDM[Double]= {
+         BDM.create(1,kvalue,(Fu + stepSize * direction).data.map{x =>
+         math.min(math.max(x ,MIN_F_),MAX_F_)})
+    }
+
+    val initG=G.outerJoinVertices(F){
+        (vid,vdata,vector)=>{
+        //val defaultvec=Vectors.dense(Array.fill(S.size)(Random.nextInt(2).toDouble)).toSparse
+	    val defaultvec=Vectors.dense(Array.fill(S.size)(0.0)).toSparse
+        (vector.getOrElse(defaultvec),mutable.Map[Long,Vector](),0.toDouble,true)
+    }
+    }
+
+    var sumF=initG.vertices.map{case (id,attr)=>
+		    val fu=BDM.create(1,kvalue,attr._1.toArray)
+            fu
+    }.reduce(_+_)
+
+
+    def vertexProgram(id: VertexId, attr: (Vector, mutable.Map[Long,Vector],Double,Boolean), msgSum: Array[(Long,Vector)]): (Vector, mutable.Map[Long,Vector],Double,Boolean) = {
+        if(msgSum.isEmpty)
+        {
+            return attr;
+        }
+        else
+        {
+            //更新neigh
+		    for((key,value)<-msgSum.toMap)
+		    {
+		       attr._2.update(key,value)
+		    }
+            //计算llh以及grad
+		    val fu=BDM.create(1,kvalue,attr._1.toArray)
+		    val fusfT = (fu * BDM.create(kvalue, 1, sumF.data)).data(0)
+            val fufuT = (fu * BDM.create(kvalue, 1, fu.data)).data(0)
+		    val sf=sumF
+		    val kq=attr._2.values.map{m=>
+		    	val fv=BDM.create(1,kvalue,m.toArray);
+		    	var fvT = BDM.create(kvalue, 1,fv.data);
+		    	var fufvT = (fu * fvT).data(0);
+		    	var fufvTrange = math.min(math.max(math.exp(-fufvT),MIN_P_),MAX_P_);
+		    	((math.log(1 - fufvTrange)+ fufvT),fv*(1/(1 - fufvTrange)))}.reduce((a,b) => (a._1+b._1,a._2+b._2))
+		    (kq._1 - fusfT + fufuT,kq._2 - sf + fu)//llh,grad
+            val llh=kq._1
+            val grad=kq._2
+            //计算新的newvec
+		    val stepselected=listSearch.map(stepx=>{
+		    	val newfu=step(fu,stepx,grad);
+		    	val newfuT = BDM.create(kvalue,1,newfu.data);
+		    	val newsfT = BDM.create[Double](kvalue, 1, sumF.data) - BDM.create(kvalue,1,fu.data) + newfuT;			
+		    	var newllh = attr._2.values.map{m =>
+		    		val tmpdata=BDM.create(1,kvalue,m.toArray);
+		    		var xc = newfu*BDM.create(kvalue,1,tmpdata.data);
+		    		math.log(1- math.min(math.max(math.exp(-xc.data(0)),MIN_P_),MAX_P_))+ xc.data(0);
+		    	}.reduce(_+_) -(newfu*newsfT).data(0)+(newfu*newfuT).data(0);
+		    	(stepx,(newllh,newfu))	}
+		    ).filter{case(a:Double,(b:Double,c:BDM[Double]))=>b>=(llh + (alpha*a*grad * BDM.create(kvalue,1,grad.data)).data.reduce(_+_))}.sortBy(_._1)
+		    if(stepselected.isEmpty)
+		    {
+		    	(attr._1,attr._2,llh,false)
+		    }
+		    else	
+		    {
+		    	val selected=stepselected.last
+                val newfu=selected._2._2
+                sumF=sumF+newfu-fu
+                val newvec=Vectors.dense(newfu.toArray).toSparse
+                (newvec,attr._2,llh,true)
+		    }
+               
+        }
+    }
+   
+    def sendMessage(edge: EdgeTriplet[(Vector, mutable.Map[Long,Vector],Double,Boolean), Long]) = {    
+        if (edge.dstAttr._4 == true) {
+            Iterator((edge.srcId, Array((edge.dstId,edge.dstAttr._1))))
+        }
+        else
+        {
+            Iterator.empty
+        }
+        if (edge.srcAttr._4 == true) {
+            Iterator((edge.dstId, Array((edge.srcId,edge.srcAttr._1))))
+        }
+        else
+        {
+            Iterator.empty
+        }
+    }
+    
+    def messageCombiner(a: Array[(Long,Vector)], b: Array[(Long,Vector)]): Array[(Long,Vector)] = a ++ b
+    val initialMessage = Array[(Long,Vector)]()
+    val vp={
+            (id: VertexId, attr: (Vector, mutable.Map[Long,Vector],Double,Boolean), msgSum: Array[(Long,Vector)]) =>vertexProgram(id, attr, msgSum)
+    } 
+
+    val finalgraph=Pregel(initG, initialMessage, activeDirection = EdgeDirection.Either)(vp, sendMessage, messageCombiner)
 
      
-     def step(Fu:BDM[Double], stepSize:Double, direction:BDM[Double]):BDM[Double]= {
-       BDM.create(1,kvalue,(Fu + stepSize * direction).data.map{x =>
-         math.min(math.max(x ,MIN_F_),MAX_F_)})
-     }
-    
-     def aggregatorNeighandVec(a: (Array[Long],Array[org.apache.spark.mllib.linalg.Vector]), b: (Array[Long],Array[org.apache.spark.mllib.linalg.Vector])): (Array[Long],Array[org.apache.spark.mllib.linalg.Vector]) = {                                  
-         (a._1++b._1,a._2++b._2)
-     }
-
-     def mergestep(a:(Double, breeze.linalg.DenseMatrix[Double],breeze.linalg.DenseMatrix[Double]),b:(Double, breeze.linalg.DenseMatrix[Double],breeze.linalg.DenseMatrix[Double])):(Double,breeze.linalg.DenseMatrix[Double],breeze.linalg.DenseMatrix[Double])=
-     {
-		if(a._1>b._1)
-		{
-			a
-		}
-		else
-		{
-			b
-		}
-     }
-
-     var alpha = 0.05
-     var beta = 0.1
-     var MaxIter =15
-     //var oldFuT = BDM.create(kvalue,1,fu.data)
-     var stepSize: Double = 1.0
-     var listSearch: List[Double] = List(1.0)
-     for(i <- 1 to MaxIter) {
-       stepSize *=beta
-       listSearch = stepSize::listSearch
-     }
-     var liststepSizeRDD = sc.makeRDD(listSearch)
-     def backtrackingLineSearchs(uset:List[Long],edgerdd:RDD[(Long,Long)]): Double =
-     {
-      	val outedges=edgerdd.map(e => (e._1,e._2))
-      	val inedges=edgerdd.map(e => (e._2,e._1))
-      	val alledges=outedges.union(inedges).toDF("node","tonode")
-      	val temp=alledges.join(F,alledges("node")===F("node")).toDF("fromnode","node","node1","vector").select("fromnode","node","vector")
-      	val tocompute=temp.join(F,temp("node")===F("node")).toDF("fromnode","tonode","fromvector","node","tovector").select("fromnode","tonode","fromvector","tovector").map(r=>((r.getLong(0),r.getAs[org.apache.spark.mllib.linalg.Vector](2)),(Array(r.getLong(1)),Array(r.getAs[org.apache.spark.mllib.linalg.Vector](3))))).rdd.reduceByKey(aggregatorNeighandVec).map(x=>(x._1._1,x._1._2,x._2._2,x._2._1))
-
-        //PRE-BACKTRACKING LINE SEARCH
-        var result1 = tocompute.filter(x=> uset.contains(x._1)).map{case(ux,y,z,neighs)=>
-        var fu = BDM.create(1,kvalue,y.toArray);
-        var fusfT = (fu*BDM.create(kvalue,1,sumF.data)).data(0);
-        var sf = sumF
-        var fufuT = (fu*BDM.create(kvalue,1,fu.data)).data(0);
-        var kq =z.map {m =>
-            var fv = BDM.create(1,kvalue,m.toArray);
-            var fvT = BDM.create(kvalue, 1, fv.data);
-            var fufvT = (fu * fvT).data(0);
-            var fufvTrange = math.min(math.max(math.exp(-fufvT),MIN_P_),MAX_P_);
-            (math.log(1- fufvTrange)+ fufvT,fv*(1/(1 - fufvTrange)))}.reduce((a,b) => (a._1+b._1,a._2+b._2))
-        (ux,fu, kq._2 - sf + fu,kq._1 - fusfT + fufuT,neighs,z)//(u,fu,grad,llh,neighbor,neighvec)
-        }.persist()
-    
-        //TODO
-        // BACKTRACKING LINE SEARCH
-        var kq1 = result1.cartesian(liststepSizeRDD).coalesce(1000).map{ case (x,stepx) =>
-        var newfu = step(x._2,stepx,x._3);
-        val fuT = BDM.create(kvalue,1,newfu.data);
-        val sfT = BDM.create[Double](kvalue, 1, sumF.data) - BDM.create(kvalue,1,x._2.data) + fuT;
-        var result = x._6.map{m =>
-            val tmpdata=BDM.create(1,kvalue,m.toArray);
-            var xc = newfu*BDM.create(kvalue,1,tmpdata.data)
-            math.log(1- math.min(math.max(math.exp(-xc.data(0)),MIN_P_),MAX_P_))+ xc.data(0)
-        }.reduce(_+_) -(newfu*sfT).data(0)+(newfu*fuT).data(0)
-        (x._1,stepx,result >= (x._4 + (alpha*stepx*x._3 * BDM.create(kvalue,1,x._3.data)).data.reduce(_+_)),x._2,x._3)
-	}.filter(_._3).map(x => (x._1,(x._2,x._4,x._5))).reduceByKey(mergestep).map(x=>(x._1,x._2._2,step(x._2._2,x._2._1,x._2._3))).persist()
-        //UPDATE F and SUMF
-        var Sx: Array[Long] = Array()
-        if(kq1.count() != 0)
-        {
-            Sx = kq1.map(_._1).collect
-            //F = F.rdd.filter(x => !Sx.contains(x.getLong(0))).union(kq1.map(x=> (x._1,x._3)))
-            F=F.filter(x => !Sx.contains(x.getLong(0))).union(kq1.map(x=> (x._1,new DenseVector(x._3.toArray).toSparse)).toDF("node","vector"))
-            var changeFu =kq1.map(x=>(x._2,x._3)).reduce((a,b) => (a._1+ b._1,a._2+b._2))
-            sumF = sumF - changeFu._1 + changeFu._2
-        }
-        val LLH = loglikelihood(F,sumF,alledges,kvalue,spark)
-	    return LLH
-  }
-
-
-
-
-  def MBSGD():Unit={
-      var LLHold = loglikelihood(F,sumF,trainrdd,kvalue,spark)
-      println("LLH: " + LLHold)
-      //var size = G.vertices.count()
-      breakable {
-        var i =0
-        while (true) {
-            //to train it on the trainrdd
-            var newLLH = backtrackingLineSearchs(uset,trainrdd)
-            i+= uset.size
-            println(" Inter: "+ i + " LLH: " + newLLH )
-            if (math.abs(1 - newLLH/ LLHold) < 0.0001) {break}
-            LLHold = newLLH
-      }
-    }
-  }
-
-  MBSGD()
-  //to verify the effect on the testrdd
-  val verifyll=loglikelihood(F,sumF,testrdd,kvalue,spark)
-  return (F,verifyll)
+    val Fdf=finalgraph.vertices.map{case (id,attr)=>(id,attr._1)}.toDF("node","vector")
+    val verifyll=loglikelihood(Fdf,sumF,testrdd,kvalue,spark)
+    return (Fdf,verifyll)
 }
-
 
 
 
@@ -190,26 +195,27 @@ def run(graphpath:String):Unit={
           .appName(s"BigClam").getOrCreate()
     import spark.implicits._
     val sc=spark.sparkContext
-    val hadoopConf = spark.sparkContext.hadoopConfiguration
-    @transient
-    val fs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
-
-    //for simple data
-    //alert!!!所有的节点id最好是紧凑的格式，例如id为0~max(num_node)-1的形式,这样能最大化减少运行中的内存占用
     val edgerdd=spark.read.textFile(graphpath).filter(!_.contains("#")).map(_.split("\t")).distinct.map(r=>(r(0).toLong,r(1).toLong)).rdd.persist()
+
     val edges=edgerdd.map(e => Edge(e._1,e._2, 1L))
     val defaultvalue=""
     val G=Graph.fromEdges(edges,defaultvalue)
   
+    
+    
     val epsCommForce = 1e-6
     
+    //构造Neightborbc,key为节点,value为节点对应的邻居
     val collectNeighbor = G.ops.collectNeighborIds(EdgeDirection.Either).map{case(id,attr)=>(id,attr)}.persist()
-    val EgoNeighbor = collectNeighbor.map(x =>(x._1,Array(x._1)++x._2))
+
+
+    val Neightborhoodbc = collectNeighbor.map(x =>(x._1,Array(x._1)++x._2))
 
     def aggregatorForTag(a: (Array[Long], Array[Long]), b: (Array[Long], Array[Long])): (Array[Long], Array[Long]) = {                                    
          ((a._1++b._1).distinct,(a._2++b._2))
     }
 
+    
     def aggregatorForMinimal(a: Double, b: Double): Double = {                                    
              if(a<=b)
 	     {
@@ -245,17 +251,21 @@ def run(graphpath:String):Unit={
 
     def conductanceLocalMin(): Array[Long]={
             // compute conductance for all nodes
-            val egonet=EgoNeighbor
+            val egonet=Neightborhoodbc
             val sigmaDegres = sc.broadcast((G.inDegrees ++ G.outDegrees).reduceByKey(_+_).map(_._2).reduce(_+_))           
+            //将egonet中的(x,neigh(x))展开为(x,n1),(x,n2),(x,n2)
+            //等价于将edges反过来和原来的union，并且加上连接上自身的边
             val outedges=edgerdd.map(e => (e._1,e._2))
             val inedges=edgerdd.map(e => (e._2,e._1))
             val selfedges=G.vertices.map{case(id,attr)=>id}.map(x=>(x,x))
             val egonetedges=outedges.union(inedges).union(selfedges).toDF("fromnode","node")
 
+            //将egonetedges和collectNeighbor进行join，找到二阶邻居
             val onedegreeneigh=collectNeighbor.toDF("node","neigharray")
+            
             val twodegreeneigh=egonetedges.join(onedegreeneigh,egonetedges("node")===onedegreeneigh("node")).toDF("fromnode","tonode","tonode1","neigharray").select("fromnode","tonode","neigharray").map(r=>(r.getLong(0),(Array(r.getLong(1)),r.getAs[Seq[Long]](2).toArray))).rdd
 
-            //to make (x,1neigh(x),2neigh(x))
+             //通过reducebykey聚合(x,1neigh(x),2neigh(x))
             val oneandtwoneigh=twodegreeneigh.reduceByKey(aggregatorForTag) 
             val ConductanceRDD =oneandtwoneigh.map{case(x,(y,z))=>
               var cut_S = z.map(i => if(y.contains(i)) 0.0 else 1.0).filter(m => m == 1.0).size;
@@ -265,40 +275,40 @@ def run(graphpath:String):Unit={
             }
          
             val ConductanceDF=ConductanceRDD.toDF("node","conducu")
+           
 	        val alledges=outedges.union(inedges).toDF("fromnode","node") 
             val minimal_1=alledges.join(ConductanceDF,alledges("node")===ConductanceDF("node")).toDF("node","tonode","node1","dstconducu").select("node","tonode","dstconducu")
 	        val minimal_2=minimal_1.join(ConductanceDF,minimal_1("node")===ConductanceDF("node")).toDF("fromnode","tonode","dstconducu","node1","srcconducu").select("fromnode","tonode","dstconducu","srcconducu")
-	        //TODO,i am not sure which method is correct
+	        //TODO，以下两种算法不清楚哪种对
 	        //method 1
 	        val indx=minimal_2.map(r=>((r.getLong(0),r.getDouble(3)),r.getDouble(2))).rdd.reduceByKey(aggregatorForMinimal).filter{case ((x,y),z)=>y<=z}.map{case ((x,y),z)=>x}.collect.distinct
 
 	        //method 2
 	        //val indx=minimal_2.map(r=>(r.getLong(0),(r.getDouble(2),r.getLong(1)))).rdd.reduceByKey(NeighMinimal).map(_._2._2).collect.distinct
+       
             sigmaDegres.destroy()
             return indx
     }
 
     
+    val Array(trainrdd,testrdd) = edgerdd.randomSplit(Array(0.8, 0.2))
     var uset = G.vertices.map(_._1).collect.toList
-    var S = conductanceLocalMin()
-    
-    //kvalue need to be less than S.size
+   
+    var S=conductanceLocalMin()
+        
+    //var kvalue=S.size
     var kvalue=100
     val vcount=uset.size
     println("kvalue: " + kvalue)
     println("S.size: " + S.size)
     println("uset: " + vcount)
     
-    def randomIndexedRow(index:Long,n : Int ):IndexedRow={
-        IndexedRow(index.toLong,Vectors.dense(Array.fill(n)(Random.nextInt(2).toDouble)).toSparse)
-    }
 
-
-    //to init the cluster-affilation matrix,c2n uses cluster as row and node as column,and n2c use nodes as row,cluster as column
+    //初始化node和cluster之间的二部图矩阵F
     def initNeighborComF(): DataFrame={
             // Get S set which is conductance of locally minimal
             val sinx=sc.broadcast(S.zipWithIndex.toMap)
-
+            //求解以node id为index，node id和各个cluster连接的权重矩阵
             val columnselect=collectNeighbor.map(x=>{
                     var ind=x._2.filter(r=>S.contains(r)).distinct.map(r=>sinx.value(r)).sorted;
                     var addColumn:SparseVector = null
@@ -319,20 +329,17 @@ def run(graphpath:String):Unit={
                     var value=Array.fill(ind.size)(1.0);
                     val y=new SparseVector(kvalue, ind, value);
                     (x._1,y)}).toDF("node","vector")
-            
 
             sinx.destroy()
-            columnselect
+            columnselect 
      }
-     val n2c:DataFrame=initNeighborComF
+     val n2c=initNeighborComF
      collectNeighbor.unpersist()
-    
-     val Array(trainrdd,testrdd) = edgerdd.randomSplit(Array(0.8, 0.2))
-     //change the kvalue to see the variants of value,select the kvalue which makes value biggest
      var (finalmatrix:DataFrame,value:Double)=Optimize(kvalue,n2c,trainrdd,testrdd,S,uset,spark)
-     edgerdd.unpersist()
 
-    //print the best result 
+     edgerdd.unpersist()
+    
+    //比较不同kvalue下的value大小，取最大的value对应的k，以及F作为分类的结果,这里省略
      val F=finalmatrix
      var e = 2.0*G.collectEdges(EdgeDirection.Either).count/(G.vertices.count*(G.vertices.count - 1))
      e = math.sqrt(-math.log(1-e))
@@ -346,18 +353,18 @@ def run(graphpath:String):Unit={
              Vectors.dense(x._2.map(value =>if (value>=e) 1.0 else 0.0)).toSparse.indices
              })
      }
-     Com.flatMap{case(x,y) => y.map(c => (c,x))}.rdd.groupByKey().coalesce(100).saveAsTextFile("/tmp/bigclam/kq-youhua.txt")
+     Com.flatMap{case(x,y) => y.map(c => (c,x))}.rdd.groupByKey().coalesce(100).saveAsTextFile("/tmp/kq-youhua.txt")
 
   }
 
 }
 
-object BigClam{
+object BigClamPregel{
     def main(args: Array[String]) {
         print(args.size)
         print(args)
         val Array(graphpath) = args
-        new BigClam().run(graphpath)
+        new BigClamPregel().run(graphpath)
     }
     
 }

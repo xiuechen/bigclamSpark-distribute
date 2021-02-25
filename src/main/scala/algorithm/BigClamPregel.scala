@@ -128,6 +128,10 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
 		    (kq._1 - fusfT + fufuT,kq._2 - sf + fu)//llh,grad
             val llh=kq._1
             val grad=kq._2
+            if(attr._3!=0 && math.abs(1 - llh/ attr._3) < 0.0001)
+            {
+                return (attr._1,attr._2,llh,false)
+            }
             //计算新的newvec
 		    val stepselected=listSearch.map(stepx=>{
 		    	val newfu=step(fu,stepx,grad);

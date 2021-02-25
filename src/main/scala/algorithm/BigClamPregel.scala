@@ -309,7 +309,7 @@ def run(graphpath:String):Unit={
             // Get S set which is conductance of locally minimal
             val sinx=sc.broadcast(S.zipWithIndex.toMap)
             //求解以node id为index，node id和各个cluster连接的权重矩阵
-            val columnselect=collectNeighbor.map(x=>{
+            val columnselect=Neightborhoodbc.map(x=>{
                     var ind=x._2.filter(r=>S.contains(r)).distinct.map(r=>sinx.value(r)).sorted;
                     var addColumn:SparseVector = null
                     if(S.size < kvalue)
@@ -322,8 +322,7 @@ def run(graphpath:String):Unit={
                     }
                     if(addColumn!=null)
                     {
-                        val addinx=addColumn.indices
-                        addinx.map(x=>x+S.size)
+                        val addinx=addColumn.indices.map(x=>x+S.size)
                         ind=ind ++ addinx
                     }
                     var value=Array.fill(ind.size)(1.0);
@@ -353,7 +352,10 @@ def run(graphpath:String):Unit={
              Vectors.dense(x._2.map(value =>if (value>=e) 1.0 else 0.0)).toSparse.indices
              })
      }
-     Com.flatMap{case(x,y) => y.map(c => (c,x))}.rdd.groupByKey().coalesce(100).saveAsTextFile("/tmp/kq-youhua.txt")
+     def aggfornodes(a: Array[Long], b: Array[Long]): Array[Long] = {                                    
+         a++b
+     }
+     Com.flatMap{case(x,y) => y.map(c => (c,Array(x)))}.rdd.reduceByKey(aggfornodes).coalesce(100).map(x=>(x._1,x._2.mkString(","))).saveAsTextFile("/tmp/kq-youhua.txt")
 
   }
 

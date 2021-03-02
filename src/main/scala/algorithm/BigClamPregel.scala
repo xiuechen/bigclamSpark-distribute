@@ -165,7 +165,7 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
         }
     }
    
-    def sendMessage(edge: EdgeTriplet[(Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean), Long]) = {    
+    /*def sendMessage(edge: EdgeTriplet[(Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean), Long]) = {    
         if (edge.dstAttr._4 == true) {
             Iterator((edge.srcId, Array((edge.dstId,edge.dstAttr._1))))
         }
@@ -180,6 +180,15 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
         {
             Iterator.empty
         }
+    }*/
+    
+    def sendMessage(edge: org.apache.spark.graphx.EdgeContext[(Vector, Array[Long],mutable.Map[Long,Vector],Double,Boolean), Long,Array[(Long,Vector)]]) = { 
+        if (edge.dstAttr._5 == true) {
+            edge.sendToSrc(Array((edge.dstId,edge.dstAttr._1)))
+        }
+        if (edge.srcAttr._5 == true) {
+            edge.sendToDst(Array((edge.srcId,edge.srcAttr._1)))
+        }
     }
     
     def messageCombiner(a: Array[(Long,Vector)], b: Array[(Long,Vector)]): Array[(Long,Vector)] = a ++ b
@@ -187,8 +196,43 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
     val vp={
             (id: VertexId, attr: (Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean), msgSum: Array[(Long,Vector)]) =>vertexProgram(id, attr, msgSum)
     } 
+    
+    var g = initG.mapVertices((vid, vdata) => vp(vid, vdata, initialMessage)).cache()
+    //var messages = g.mapReduceTriplets(sendMessage, messageCombiner)
+    var messages = g.aggregateMessages[Array[(Long,Vector)]](sendMessage, messageCombiner)
+    var activeMessages = messages.count()
+    var prevG: Graph[(Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean), Long] = null
+    var LLHold=g.vertices.values.map(_._4).reduce(_+_)
+     println("LLH: " + LLHold) 
+    var newLLH=LLHold
 
-    val finalgraph=Pregel(initG, initialMessage, activeDirection = EdgeDirection.Either)(vp, sendMessage, messageCombiner)
+    var i = 0
+    while (activeMessages > 0 && i < Int.MaxValue) {
+        prevG = g
+        g = g.joinVertices(messages)(vp).cache()
+        val oldMessages = messages
+        val oldsumF=sumF
+        //messages = g.mapReduceTriplets(sendMessage, messageCombiner,Some((oldMessages,EdgeDirection.Either))).cache()
+        messages = g.aggregateMessages[Array[(Long,Vector)]](sendMessage, messageCombiner).cache()
+        activeMessages = messages.count()
+		newLLH=g.vertices.values.map(_._4).reduce(_+_)
+        println("i: " +i+" llh:"+newLLH+" msgcount:"+ activeMessages)
+        logInfo("Pregel finished iteration " + i+" llh:"+newLLH)
+        oldMessages.unpersist(blocking = false)
+        prevG.unpersistVertices(blocking = false)
+        prevG.edges.unpersist(blocking = false)
+		if ( LLHold != 0.0 && math.abs(1 - newLLH/ LLHold) < 0.0001) {break}
+		LLHold=newLLH
+        sumF=g.vertices.map{case (id,attr)=>
+	    	    val fu=BDM.create(1,kvalue,attr._1.toArray)
+                fu
+        }.reduce(_+_)
+        i=i+1
+    }
+    messages.unpersist(blocking = false)
+    val finalgraph=g
+
+    //val finalgraph=Pregel(initG, initialMessage, activeDirection = EdgeDirection.Either)(vp, sendMessage, messageCombiner)
 
      
     val Fdf=finalgraph.vertices.map{case (id,attr)=>(id,attr._1)}.toDF("node","vector")

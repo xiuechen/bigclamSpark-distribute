@@ -92,7 +92,7 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
         (vid,vdata,vector)=>{
         //val defaultvec=Vectors.dense(Array.fill(S.size)(Random.nextInt(2).toDouble)).toSparse
 	    val defaultvec=Vectors.dense(Array.fill(S.size)(0.0)).toSparse
-        (vector.getOrElse(defaultvec),mutable.Map[Long,Vector](),0.toDouble,true)
+        (vector.getOrElse(defaultvec),Array[Long](),mutable.Map[Long,Vector](),0.toDouble,true)
     }
     }
 
@@ -102,43 +102,48 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
     }.reduce(_+_)
 
 
-    def vertexProgram(id: VertexId, attr: (Vector, mutable.Map[Long,Vector],Double,Boolean), msgSum: Array[(Long,Vector)]): (Vector, mutable.Map[Long,Vector],Double,Boolean) = {
+    def vertexProgram(id: VertexId, attr: (Vector, Array[Long],mutable.Map[Long,Vector],Double,Boolean), msgSum: Array[(Long,Vector)]): (Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean) = {
         if(msgSum.isEmpty)
         {
             return attr;
         }
         else
         {
+            var neigharr=attr._2
+            if(attr._2.isEmpty && !msgSum.isEmpty)
+            {
+               neigharr=msgSum.map(x=>x._1)              
+            }
+            
             //更新neigh
 		    for((key,value)<-msgSum.toMap)
 		    {
-		       attr._2.update(key,value)
+		       attr._3.update(key,value)
 		    }
             //计算llh以及grad
 		    val fu=BDM.create(1,kvalue,attr._1.toArray)
 		    val fusfT = (fu * BDM.create(kvalue, 1, sumF.data)).data(0)
             val fufuT = (fu * BDM.create(kvalue, 1, fu.data)).data(0)
 		    val sf=sumF
-		    val kq=attr._2.values.map{m=>
-		    	val fv=BDM.create(1,kvalue,m.toArray);
+		    val kq=neigharr.map{m=>
+		    	val fv=BDM.create(1,kvalue,attr._3.get(m).get.toArray);
 		    	var fvT = BDM.create(kvalue, 1,fv.data);
 		    	var fufvT = (fu * fvT).data(0);
 		    	var fufvTrange = math.min(math.max(math.exp(-fufvT),MIN_P_),MAX_P_);
 		    	((math.log(1 - fufvTrange)+ fufvT),fv*(1/(1 - fufvTrange)))}.reduce((a,b) => (a._1+b._1,a._2+b._2))
-		    (kq._1 - fusfT + fufuT,kq._2 - sf + fu)//llh,grad
-            val llh=kq._1
-            val grad=kq._2
-            if(attr._3!=0 && math.abs(1 - llh/ attr._3) < 0.0001)
+            val llh=kq._1- fusfT + fufuT
+            val grad=kq._2- sf + fu
+            if(attr._4!=0 && math.abs(1 - llh/ attr._4) < 0.0001)
             {
-                return (attr._1,attr._2,llh,false)
+                return (attr._1,neigharr,attr._3,llh,false)
             }
             //计算新的newvec
 		    val stepselected=listSearch.map(stepx=>{
 		    	val newfu=step(fu,stepx,grad);
 		    	val newfuT = BDM.create(kvalue,1,newfu.data);
 		    	val newsfT = BDM.create[Double](kvalue, 1, sumF.data) - BDM.create(kvalue,1,fu.data) + newfuT;			
-		    	var newllh = attr._2.values.map{m =>
-		    		val tmpdata=BDM.create(1,kvalue,m.toArray);
+		    	var newllh = attr._2.map{m =>
+		    		val tmpdata=BDM.create(1,kvalue,attr._3.get(m).get.toArray);
 		    		var xc = newfu*BDM.create(kvalue,1,tmpdata.data);
 		    		math.log(1- math.min(math.max(math.exp(-xc.data(0)),MIN_P_),MAX_P_))+ xc.data(0);
 		    	}.reduce(_+_) -(newfu*newsfT).data(0)+(newfu*newfuT).data(0);
@@ -146,7 +151,7 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
 		    ).filter{case(a:Double,(b:Double,c:BDM[Double]))=>b>=(llh + (alpha*a*grad * BDM.create(kvalue,1,grad.data)).data.reduce(_+_))}.sortBy(_._1)
 		    if(stepselected.isEmpty)
 		    {
-		    	(attr._1,attr._2,llh,false)
+		    	(attr._1,neigharr,attr._3,llh,false)
 		    }
 		    else	
 		    {
@@ -154,13 +159,13 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
                 val newfu=selected._2._2
                 sumF=sumF+newfu-fu
                 val newvec=Vectors.dense(newfu.toArray).toSparse
-                (newvec,attr._2,llh,true)
+                (newvec,neigharr,attr._3,llh,true)
 		    }
                
         }
     }
    
-    def sendMessage(edge: EdgeTriplet[(Vector, mutable.Map[Long,Vector],Double,Boolean), Long]) = {    
+    def sendMessage(edge: EdgeTriplet[(Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean), Long]) = {    
         if (edge.dstAttr._4 == true) {
             Iterator((edge.srcId, Array((edge.dstId,edge.dstAttr._1))))
         }
@@ -180,7 +185,7 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
     def messageCombiner(a: Array[(Long,Vector)], b: Array[(Long,Vector)]): Array[(Long,Vector)] = a ++ b
     val initialMessage = Array[(Long,Vector)]()
     val vp={
-            (id: VertexId, attr: (Vector, mutable.Map[Long,Vector],Double,Boolean), msgSum: Array[(Long,Vector)]) =>vertexProgram(id, attr, msgSum)
+            (id: VertexId, attr: (Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean), msgSum: Array[(Long,Vector)]) =>vertexProgram(id, attr, msgSum)
     } 
 
     val finalgraph=Pregel(initG, initialMessage, activeDirection = EdgeDirection.Either)(vp, sendMessage, messageCombiner)

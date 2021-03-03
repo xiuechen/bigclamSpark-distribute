@@ -207,7 +207,8 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
     var newLLH=LLHold
 
     var i = 0
-    while (activeMessages > 0 && i < Int.MaxValue) {
+    var flag = true
+    while (activeMessages > 0 && i < Int.MaxValue && flag) {
         prevG = g
         g = g.joinVertices(messages)(vp).cache()
         val oldMessages = messages
@@ -221,7 +222,7 @@ def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Lon
         oldMessages.unpersist(blocking = false)
         prevG.unpersistVertices(blocking = false)
         prevG.edges.unpersist(blocking = false)
-		if ( LLHold != 0.0 && math.abs(1 - newLLH/ LLHold) < 0.0001) {break}
+		if ( LLHold != 0.0 && math.abs(1 - newLLH/ LLHold) < 0.0001) {flag = false}
 		LLHold=newLLH
         sumF=g.vertices.map{case (id,attr)=>
 	    	    val fu=BDM.create(1,kvalue,attr._1.toArray)

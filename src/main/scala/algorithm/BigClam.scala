@@ -1,4 +1,4 @@
-package algorithm.bigclam
+package com.baidu.yundata.kg.algorithm.bigclam
 
 
 
@@ -17,12 +17,210 @@ import org.apache.spark.broadcast.Broadcast
 import com.clearspring.analytics.hash.MurmurHash
 import org.apache.spark.sql.{DataFrame, Row, SaveMode, SparkSession}
 import org.apache.hadoop.fs.Path
+import scala.collection.{immutable, mutable}
+import org.apache.spark.graphx.GraphXUtils
+import org.apache.spark.storage.StorageLevel
+import scala.collection.mutable.ArrayBuffer
+import com.baidu.yundata.kg.util.checkpoint._
+
+
 
 
 
 class BigClam extends org.apache.spark.internal.Logging with Serializable {
+def MIN_P_ = 0.0001
+def MAX_P_ = 0.9999
+def MIN_F_ = 0.0
+def MAX_F_ = 1000.0
 
-def loglikelihood(F:DataFrame,sumF:breeze.linalg.DenseMatrix[Double],alledges:DataFrame,kvalue:Int,spark: SparkSession):Double ={
+def mydot(x: SparseVector, y: SparseVector):Double={
+    val xValues = x.values
+    val xIndices = x.indices
+    val yValues = y.values
+    val yIndices = y.indices
+    val nnzx = xIndices.length
+    val nnzy = yIndices.length
+
+    var kx = 0
+    var ky = 0
+    var sum = 0.0
+    // y catching x
+    while (kx < nnzx && ky < nnzy) {
+      val ix = xIndices(kx)
+      while (ky < nnzy && yIndices(ky) < ix) {
+        ky += 1
+      }
+      if (ky < nnzy && yIndices(ky) == ix) {
+        sum += xValues(kx) * yValues(ky)
+        ky += 1
+      }
+      kx += 1
+    }
+    sum
+}
+
+def mydot(x: SparseVector, y: DenseVector): Double = {
+    val xValues = x.values
+    val xIndices = x.indices
+    val yValues = y.values
+    val nnz = xIndices.length
+
+    var sum = 0.0
+    var k = 0
+    while (k < nnz) {
+      sum += xValues(k) * yValues(xIndices(k))
+      k += 1
+    }
+    sum
+}
+
+def mydot(x: DenseVector, y: DenseVector): Double = {
+    val xValues = x.values
+    val yValues = y.values
+    val nnz = x.size
+
+    var sum = 0.0
+    var k = 0
+    while (k < nnz) {
+      sum += xValues(k) * yValues(k)
+      k += 1
+    }
+    sum
+}
+
+
+
+
+
+ 
+def maptosparse(a:scala.collection.immutable.Map[Int,Double],kvalue:Int):SparseVector={
+  val info=a.toArray.sortBy(_._1)
+ val ind=info.map(x=>x._1) 
+ val value=info.map(x=>x._2) 
+ val y=new SparseVector(kvalue, ind, value);
+ y
+}
+
+def sparsetomap(a:SparseVector):scala.collection.immutable.Map[Int,Double]={
+ val y=a.indices.zip(a.values).toMap;
+ y
+}
+
+
+def sum(a:scala.collection.immutable.Map[Int,Double],b:DenseVector):DenseVector={
+    val yValues=b.values
+    val kvalue=b.size
+    val newvalues=new Array[Double](kvalue)
+       
+    var k = 0
+    while (k < kvalue) {
+      var value1=a.get(k).getOrElse(0.0) + yValues(k)
+      newvalues(k)=value1
+      k += 1
+    }
+    new DenseVector(newvalues)
+  
+}
+
+def sum(a:scala.collection.immutable.Map[Int,Double],b:DenseVector,result:DenseVector):Unit={
+    val yValues=b.values
+    val kvalue=b.size
+       
+    var k = 0
+    while (k < kvalue) {
+      var value1=a.get(k).getOrElse(0.0) + yValues(k)
+      result.values(k)=value1
+      k += 1
+    }
+}
+
+def sum(a:scala.collection.immutable.Map[Int,Double],b:scala.collection.immutable.Map[Int,Double]):scala.collection.immutable.Map[Int,Double]=
+{
+      val sumHashMap: mutable.HashMap[Int, Double] = new mutable.HashMap[Int, Double]
+      sumHashMap ++= a
+      for ((index:Int, value:Double) <- b) {
+        if (sumHashMap.contains(index)) {
+          val value1=sumHashMap.get(index).getOrElse(0.0) + value
+          if(value1==0.0)
+          {
+            sumHashMap.remove(index)
+          }
+          else
+          {
+            sumHashMap.update(index, sumHashMap.get(index).getOrElse(0.0) + value)
+          }
+        }
+        else {
+          if(value!=0.0)
+          {
+            sumHashMap.put(index, value)
+          }
+        }
+      }
+      collection.immutable.HashMap(sumHashMap.toSeq: _*)
+}
+
+def stepsum(a:scala.collection.immutable.Map[Int,Double],b:scala.collection.immutable.Map[Int,Double]):scala.collection.immutable.Map[Int,Double]=
+{
+      val sumHashMap: mutable.HashMap[Int, Double] = new mutable.HashMap[Int, Double]
+      sumHashMap ++= a
+      for ((index:Int, value:Double) <- b) {
+        if (sumHashMap.contains(index)) {
+           var value1=sumHashMap.get(index).getOrElse(0.0) + value
+           value1=math.min(math.max(value1,MIN_F_),MAX_F_)
+           if(value1==0.0)
+           {
+             sumHashMap.remove(index)
+           }
+           else
+           {
+              sumHashMap.update(index,value1)
+           }
+        }
+        else {
+          val value1=math.min(math.max(value,MIN_F_),MAX_F_)
+          if(value1!=0.0)
+          {
+            sumHashMap.put(index, value)
+          }
+        }
+      }
+      collection.immutable.HashMap(sumHashMap.toSeq: _*)
+}
+
+def myreduce(a:scala.collection.immutable.Map[Int,Double],b:scala.collection.immutable.Map[Int,Double]):scala.collection.immutable.Map[Int,Double]=
+{
+      val sumHashMap: mutable.HashMap[Int, Double] = new mutable.HashMap[Int, Double]
+      sumHashMap ++= a
+      for ((index:Int, value:Double) <- b) {
+        if (sumHashMap.contains(index)) {
+          sumHashMap.update(index, sumHashMap.get(index).getOrElse(0.0) - value)
+        }
+        else {
+          sumHashMap.put(index, -value)
+        }
+      }
+      collection.immutable.HashMap(sumHashMap.toSeq: _*)
+    
+}
+
+def myreduce(a:scala.collection.immutable.Map[Int,Double],b:DenseVector):DenseVector=
+{
+    val yValues=b.values
+    val kvalue=b.size
+    val newvalues=new Array[Double](kvalue)
+       
+    var k = 0
+    while (k < kvalue) {
+      var value1=a.get(k).getOrElse(0.0) - yValues(k)
+      newvalues(k)=value1
+      k += 1
+    }
+    new DenseVector(newvalues)
+    
+}
+
+def loglikelihood(F:DataFrame,sumF:scala.collection.immutable.Map[Int,Double],alledges:DataFrame,kvalue:Int,spark: SparkSession):Double ={
     import spark.implicits._
     val MIN_P_ = 0.0001
     val MAX_P_ = 0.9999
@@ -32,184 +230,288 @@ def loglikelihood(F:DataFrame,sumF:breeze.linalg.DenseMatrix[Double],alledges:Da
      val temp=alledges.join(F,alledges("node")===F("node")).toDF("fromnode","node","node1","vector").select("fromnode","node","vector")
      val tocompute=temp.join(F,temp("node")===F("node")).toDF("fromnode","tonode","fromvector","node","tovector").select("fromnode","tonode","fromvector","tovector").map(r=>((r.getLong(0),r.getAs[org.apache.spark.mllib.linalg.Vector](2)),Array(r.getAs[org.apache.spark.mllib.linalg.Vector](3)))).rdd.reduceByKey(aggregatorNeighVec).map(x=>(x._1._1,x._1._2,x._2))
      val result = tocompute.map{case(x,y,z)=>
-       val fu = BDM.create(1,kvalue,y.toArray)
-       
-       val fusfT = (fu * BDM.create(kvalue, 1, sumF.data)).data(0)
-       val fufuT = (fu * BDM.create(kvalue, 1, fu.data)).data(0)
+       val fu=y.toSparse
+       val sf=maptosparse(sumF,kvalue).toDense
+       val fusfT=mydot(fu,sf)
+       val fufuT=mydot(fu,fu)
        z.map {m =>
-       val tmpdata=BDM.create(1,kvalue,m.toArray)
-       var fvT = BDM.create(kvalue, 1, tmpdata.data);
-       var fufvT = (fu * fvT).data(0);
+       var fvT = m.toSparse;
+       var fufvT = mydot(fu,fvT);
        (math.log(1 - math.min(math.max(math.exp(-fufvT),MIN_P_),MAX_P_))+ fufvT)}.reduce(_+_) - fusfT + fufuT
      }.reduce(_+_)
      return result
 }
  
-def loglikelihood(F:DataFrame,sumF:breeze.linalg.DenseMatrix[Double],edgerdd:RDD[(Long,Long)],kvalue:Int,spark: SparkSession):Double ={
+def loglikelihood(F:DataFrame,sumF:scala.collection.immutable.Map[Int,Double],edgerdd:RDD[(Long,Long)],kvalue:Int,spark: SparkSession):Double ={
       import spark.implicits._
-      //make (node,nodevector,Array[neighvector]) to make LLH compute easily
+      //构造(node,nodevector,Array[neighvector])
       val outedges=edgerdd.map(e => (e._1,e._2))
       val inedges=edgerdd.map(e => (e._2,e._1))
       val alledges=outedges.union(inedges).toDF("node","tonode")
       loglikelihood(F,sumF,alledges,kvalue,spark)
 }
 
+def multi(stepsize:Double,direction:scala.collection.immutable.Map[Int,Double],kvalue:Int):scala.collection.immutable.Map[Int,Double]={
+  val info=direction.toArray.sortBy(_._1)
+ val ind=info.map(x=>x._1) 
+ val value=info.map(x=>x._2*stepsize) 
+ val y=new SparseVector(kvalue, ind, value);
+ sparsetomap(y)
+}
 
 
-def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Long,Long)],S:Array[Long],uset:List[Long],spark: SparkSession):(DataFrame,Double)=
+def step(Fu:SparseVector, stepSize:Double, direction:scala.collection.immutable.Map[Int,Double],kvalue:Int):SparseVector= {
+val y=stepsum(sparsetomap(Fu),multi(stepSize,direction,kvalue))
+val info=y.toArray.sortBy(_._1)
+val ind=info.map(x=>x._1) 
+val value=info.map(x=>x._2)
+val y1=new SparseVector(kvalue, ind, value);
+y1	 
+}
+
+
+def step(Fu:SparseVector, stepSize:Double, direction:DenseVector):SparseVector= {
+    val fumap=sparsetomap(Fu)
+    val yValues=direction.values
+    val kvalue=direction.size
+    val newvalues=new Array[Double](kvalue)
+       
+    var k = 0
+    while (k < kvalue) {
+      var value1=fumap.get(k).getOrElse(0.0) +yValues(k)*stepSize
+      value1=math.min(math.max(value1,MIN_F_),MAX_F_)
+      newvalues(k)=value1
+      k += 1
+    }
+    new DenseVector(newvalues).toSparse
+}
+
+def sumllhgrad(a:(Double,scala.collection.immutable.Map[Int,Double]),b:(Double,scala.collection.immutable.Map[Int,Double])):(Double,scala.collection.immutable.Map[Int,Double])=
+    {
+          val sumHashMap: mutable.HashMap[Int, Double] = new mutable.HashMap[Int, Double]
+          sumHashMap ++= a._2
+          for ((index:Int, value:Double) <- b._2) {
+            if (sumHashMap.contains(index)) {
+              sumHashMap.update(index, sumHashMap.get(index).getOrElse(0.0) + value)
+            }
+            else {
+              sumHashMap.put(index, value)
+            }
+          }
+          (a._1+b._1,collection.immutable.HashMap(sumHashMap.toSeq: _*))
+}
+
+def Optimize(kvalue:Int,n2c:DataFrame,trainrdd:RDD[(Long,Long)],testrdd:RDD[(Long,Long)],spark: SparkSession):(DataFrame,Double)=
 {
     import spark.implicits._
     val sc=spark.sparkContext 
-    var F=n2c
+   
+ 
+    var F=n2c.rdd.map(r=>(r.getLong(0),r.getAs[Vector](1).toSparse))
     
-    var sumF=F.rdd.map(x=>(x.getLong(0),x.getAs[Vector](1))).map(x=>{
-        var fu = BDM.create(1,kvalue,x._2.toArray);
-        fu
-    }).reduce(_+_)
+    val checkpointInterval = sc.getConf.getInt("spark.graphx.pregel.checkpointInterval", -1)
     
-    val MIN_P_ = 0.0001
-    val MAX_P_ = 0.9999
-    val MIN_F_ = 0.0
-    val MAX_F_ = 1000.0
+    val edges=trainrdd.map(e => Edge(e._1,e._2, 1))
+    val defaultvalue=""
+    val G=Graph.fromEdges(edges,defaultvalue,StorageLevel.MEMORY_ONLY_SER,StorageLevel.MEMORY_ONLY_SER)
+    val collectNeighbor = G.ops.collectNeighborIds(EdgeDirection.Either).map{case(id,attr)=>(id,attr)}.persist(StorageLevel.MEMORY_ONLY_SER)
+    
+    var sumF=F.map{case (id,attr)=>
+            val fumap=attr.toSparse.indices.zip(attr.toSparse.values).toMap
+            fumap
+    }.reduce(sum)
+	var sf=sc.broadcast(maptosparse(sumF,kvalue).toDense)
+
+    
+    var Fbc=sc.broadcast(F.collectAsMap)
+    def vertexProgram(ux:Long,neigharr:Array[Long],lastllh:Double,changed:Boolean,fu:SparseVector): (Long,Array[Long],Double,Boolean,SparseVector) = {
+        val beg = System.currentTimeMillis()
+        var fusfT = mydot(fu,sf.value);
+        var fufuT = mydot(fu,fu);
+        val kq=neigharr.map{m=>
+                    val fv=Fbc.value(m)
+                    var fufvT = mydot(fu,fv);
+                    var fufvTrange = math.min(math.max(math.exp(-fufvT),MIN_P_),MAX_P_);
+                    val fvmap=fv.indices.zip(fv.toSparse.values.map(x=>x*(1/(1 - fufvTrange)))).toMap
+                    (((math.log(1 - fufvTrange)+ fufvT),fvmap))}.reduce(sumllhgrad(_,_))
+        val llh=kq._1- fusfT + fufuT
+        val gradvec=myreduce(sum(kq._2,sparsetomap(fu)),sf.value)
+        var cost = System.currentTimeMillis() - beg
+        println("nodeid: "+ux +" llh cost2: " +cost+" llh:"+llh+" lastllh:"+lastllh)
+       if(lastllh!=0 && math.abs(1 - llh/ lastllh) < 0.0001)
+       {
+           println("nodeid: "+ux +" llh:"+llh+" lastllh"+lastllh)
+	       return (ux,neigharr,llh,false,fu)
+       }
+        
+       var selected=(0.0,(0.0,fu)) 
+       var flag=true
+       var stepx = 1.0
+       var alpha = 0.05
+       var beta = 0.1
+       var MaxIter =15
+       var i=0
+
+
+       val graddot=mydot(gradvec,gradvec) 
+       cost = System.currentTimeMillis() - beg
+       println("nodeid: "+ux +" llh cost: " +cost+" llh:"+llh+" graddot:"+graddot)
+       val newvalues=new Array[Double](kvalue)
+       var newsfT=new DenseVector(newvalues)
+
+       while(flag && i<MaxIter)
+       {
+	       //val newfu=step(fu,stepx,grad);
+	       val newfu=step(fu,stepx,gradvec);
+           cost = System.currentTimeMillis() - beg
+           println("inside "+i+" nodeid: "+ux +" llh cost: " +cost+" llh:"+llh)
+	       sum(myreduce(sparsetomap(newfu),sparsetomap(fu)),sf.value,newsfT)
+           cost = System.currentTimeMillis() - beg
+           println("inside "+i+" nodeid: "+ux +" llh cost: " +cost+" llh:"+llh)
+	       var newllh = neigharr.map{m =>
+	          val tmpdata=Fbc.value(m)
+	   	   var xc = mydot(newfu,tmpdata);
+	   	   math.log(1- math.min(math.max(math.exp(-xc),MIN_P_),MAX_P_))+ xc;
+	          }.reduce(_+_) -(mydot(newfu,newsfT))+(mydot(newfu,newfu));
+           
+           cost = System.currentTimeMillis() - beg
+           println("inside "+i+" nodeid: "+ux +" llh cost: " +cost+" llh:"+llh+" newllh:"+newllh + "neigharr size:"+ neigharr.size)
+          
+           //if(newllh==llh || newllh== Double.NegativeInfinity ||(newllh != 0.0 && math.abs(1 - llh/ newllh) < 0.00001))
+           if(newllh==llh || newllh== Double.NegativeInfinity)
+           {
+               flag=false
+           }
+           //不符合要求，继续搜索
+           else if(newllh<(llh + (alpha*stepx*graddot))) 
+           {
+               i=i+1
+               flag=true  
+               stepx = stepx * beta
+           }
+           else
+           {
+               selected=(stepx,(newllh,newfu))
+               flag=false
+           }
+       }
+	   if(selected._1==0)
+	   {
+            cost = System.currentTimeMillis() - beg
+            println("node: " +ux+" return false"+" cost:"+cost + "step: "+stepx)
+	        return (ux,neigharr,llh,false,fu)
+	    }
+	   else	
+	   {
+            cost = System.currentTimeMillis() - beg
+            println("node: " +ux+" return true"+" cost:"+cost+" step:"+selected._1+" stepx:"+stepx)
+            val newfu=selected._2._2
+            return (ux,neigharr,llh,true,newfu)
+	    }
+    }
+    val iterRDDCheckpointer = new MyPeriodicRDDCheckpointer[(Long,Array[Long],Double,Boolean,SparseVector)](
+      checkpointInterval, sc,StorageLevel.MEMORY_ONLY_SER)
+
+    var iterRDD=collectNeighbor.map{case(ux,y)=>(ux,y,0.0,false,Fbc.value(ux))}
+    iterRDDCheckpointer.update(iterRDD.asInstanceOf[RDD[(Long,Array[Long],Double,Boolean,SparseVector)]])
+    var prevRDD: RDD[(Long,Array[Long],Double,Boolean,SparseVector)] = null
+
+    var activeMessages=0l
+    var LLHold=iterRDD.map(_._3).reduce(_+_)
+    println("LLH: " + LLHold) 
+    collectNeighbor.unpersist()
+    G.unpersist()
+    
+    var newLLH=LLHold
+
+    var i = 0
+    var flag=true
+    while (flag) {
+        prevRDD = iterRDD
+        iterRDD = iterRDD.map(x=>vertexProgram(x._1,x._2,x._3,x._4,x._5))
+        iterRDDCheckpointer.update(iterRDD.asInstanceOf[RDD[(Long,Array[Long],Double,Boolean,SparseVector)]])
+        activeMessages = iterRDD.filter(x=>x._4==true).count
+		newLLH=iterRDD.map(_._3).reduce(_+_)
+        println("i: " +i+" llh:"+newLLH+" msgcount:"+ activeMessages)
+        logInfo("finished iteration " + i+" llh:"+newLLH)
+        prevRDD.unpersist()
+		if ( LLHold != 0.0 && math.abs(1 - newLLH/ LLHold) < 0.0001) {flag = false}
+		LLHold=newLLH
+        //修改F
+        Fbc.unpersist()
+        Fbc=sc.broadcast(iterRDD.map(x=>(x._1,x._5)).collectAsMap)
+
+        //修改sumF
+        sumF=iterRDD.map{case (ux,y,llh,flag,vec)=>
+                val fumap=vec.toSparse.indices.zip(vec.toSparse.values).toMap
+                fumap
+        }.reduce(sum)
+        sf.unpersist()
+	    sf=sc.broadcast(maptosparse(sumF,kvalue).toDense)
+        i=i+1
+    }
+
+    //val finalgraph=Pregel(initG, initialMessage, activeDirection = EdgeDirection.Either)(vp, sendMessage, messageCombiner)
 
      
-     def step(Fu:BDM[Double], stepSize:Double, direction:BDM[Double]):BDM[Double]= {
-       BDM.create(1,kvalue,(Fu + stepSize * direction).data.map{x =>
-         math.min(math.max(x ,MIN_F_),MAX_F_)})
-     }
-    
-     def aggregatorNeighandVec(a: (Array[Long],Array[org.apache.spark.mllib.linalg.Vector]), b: (Array[Long],Array[org.apache.spark.mllib.linalg.Vector])): (Array[Long],Array[org.apache.spark.mllib.linalg.Vector]) = {                                  
-         (a._1++b._1,a._2++b._2)
-     }
-
-     def mergestep(a:(Double, breeze.linalg.DenseMatrix[Double],breeze.linalg.DenseMatrix[Double]),b:(Double, breeze.linalg.DenseMatrix[Double],breeze.linalg.DenseMatrix[Double])):(Double,breeze.linalg.DenseMatrix[Double],breeze.linalg.DenseMatrix[Double])=
-     {
-		if(a._1>b._1)
-		{
-			a
-		}
-		else
-		{
-			b
-		}
-     }
-
-     var alpha = 0.05
-     var beta = 0.1
-     var MaxIter =15
-     //var oldFuT = BDM.create(kvalue,1,fu.data)
-     var stepSize: Double = 1.0
-     var listSearch: List[Double] = List(1.0)
-     for(i <- 1 to MaxIter) {
-       stepSize *=beta
-       listSearch = stepSize::listSearch
-     }
-     var liststepSizeRDD = sc.makeRDD(listSearch)
-     def backtrackingLineSearchs(uset:List[Long],edgerdd:RDD[(Long,Long)]): Double =
-     {
-      	val outedges=edgerdd.map(e => (e._1,e._2))
-      	val inedges=edgerdd.map(e => (e._2,e._1))
-      	val alledges=outedges.union(inedges).toDF("node","tonode")
-      	val temp=alledges.join(F,alledges("node")===F("node")).toDF("fromnode","node","node1","vector").select("fromnode","node","vector")
-      	val tocompute=temp.join(F,temp("node")===F("node")).toDF("fromnode","tonode","fromvector","node","tovector").select("fromnode","tonode","fromvector","tovector").map(r=>((r.getLong(0),r.getAs[org.apache.spark.mllib.linalg.Vector](2)),(Array(r.getLong(1)),Array(r.getAs[org.apache.spark.mllib.linalg.Vector](3))))).rdd.reduceByKey(aggregatorNeighandVec).map(x=>(x._1._1,x._1._2,x._2._2,x._2._1))
-
-        //PRE-BACKTRACKING LINE SEARCH
-        var result1 = tocompute.filter(x=> uset.contains(x._1)).map{case(ux,y,z,neighs)=>
-        var fu = BDM.create(1,kvalue,y.toArray);
-        var fusfT = (fu*BDM.create(kvalue,1,sumF.data)).data(0);
-        var sf = sumF
-        var fufuT = (fu*BDM.create(kvalue,1,fu.data)).data(0);
-        var kq =z.map {m =>
-            var fv = BDM.create(1,kvalue,m.toArray);
-            var fvT = BDM.create(kvalue, 1, fv.data);
-            var fufvT = (fu * fvT).data(0);
-            var fufvTrange = math.min(math.max(math.exp(-fufvT),MIN_P_),MAX_P_);
-            (math.log(1- fufvTrange)+ fufvT,fv*(1/(1 - fufvTrange)))}.reduce((a,b) => (a._1+b._1,a._2+b._2))
-        (ux,fu, kq._2 - sf + fu,kq._1 - fusfT + fufuT,neighs,z)//(u,fu,grad,llh,neighbor,neighvec)
-        }.persist()
-    
-        //TODO
-        // BACKTRACKING LINE SEARCH
-        var kq1 = result1.cartesian(liststepSizeRDD).coalesce(1000).map{ case (x,stepx) =>
-        var newfu = step(x._2,stepx,x._3);
-        val fuT = BDM.create(kvalue,1,newfu.data);
-        val sfT = BDM.create[Double](kvalue, 1, sumF.data) - BDM.create(kvalue,1,x._2.data) + fuT;
-        var result = x._6.map{m =>
-            val tmpdata=BDM.create(1,kvalue,m.toArray);
-            var xc = newfu*BDM.create(kvalue,1,tmpdata.data)
-            math.log(1- math.min(math.max(math.exp(-xc.data(0)),MIN_P_),MAX_P_))+ xc.data(0)
-        }.reduce(_+_) -(newfu*sfT).data(0)+(newfu*fuT).data(0)
-        (x._1,stepx,result >= (x._4 + (alpha*stepx*x._3 * BDM.create(kvalue,1,x._3.data)).data.reduce(_+_)),x._2,x._3)
-	}.filter(_._3).map(x => (x._1,(x._2,x._4,x._5))).reduceByKey(mergestep).map(x=>(x._1,x._2._2,step(x._2._2,x._2._1,x._2._3))).persist()
-        //UPDATE F and SUMF
-        var Sx: Array[Long] = Array()
-        if(kq1.count() != 0)
-        {
-            Sx = kq1.map(_._1).collect
-            //F = F.rdd.filter(x => !Sx.contains(x.getLong(0))).union(kq1.map(x=> (x._1,x._3)))
-            F=F.filter(x => !Sx.contains(x.getLong(0))).union(kq1.map(x=> (x._1,new DenseVector(x._3.toArray).toSparse)).toDF("node","vector"))
-            var changeFu =kq1.map(x=>(x._2,x._3)).reduce((a,b) => (a._1+ b._1,a._2+b._2))
-            sumF = sumF - changeFu._1 + changeFu._2
-        }
-        val LLH = loglikelihood(F,sumF,alledges,kvalue,spark)
-	    return LLH
-  }
-
-
-
-
-  def MBSGD():Unit={
-      var LLHold = loglikelihood(F,sumF,trainrdd,kvalue,spark)
-      println("LLH: " + LLHold)
-      //var size = G.vertices.count()
-      breakable {
-        var i =0
-        while (true) {
-            //to train it on the trainrdd
-            var newLLH = backtrackingLineSearchs(uset,trainrdd)
-            i+= uset.size
-            println(" Inter: "+ i + " LLH: " + newLLH )
-            if (math.abs(1 - newLLH/ LLHold) < 0.0001) {break}
-            LLHold = newLLH
-      }
-    }
-  }
-
-  MBSGD()
-  //to verify the effect on the testrdd
-  val verifyll=loglikelihood(F,sumF,testrdd,kvalue,spark)
-  return (F,verifyll)
+    val Fdf=iterRDD.map(x=>(x._1,x._5)).toDF("node","vector")
+    val verifyll=loglikelihood(Fdf,sumF,testrdd,kvalue,spark)
+    println("verifyll: " + verifyll) 
+    return (Fdf,verifyll)
 }
 
 
 
-
 def run(graphpath:String):Unit={
+    val conf = new SparkConf
+    conf.registerKryoClasses(Array(
+                                classOf[BigClam],
+                                classOf[MyPeriodicGraphCheckpointer[(Vector,Array[Long],mutable.Map[Long,Vector],Double,Boolean), Int]],
+                                classOf[MyPeriodicRDDCheckpointer[(VertexId, Array[(Long,Vector)])]],
+                                classOf[mutable.Map[Long,Vector]],
+                                classOf[Array[Long]],
+                                classOf[Edge[Object]],
+                                classOf[(VertexId,Object)],
+                                classOf[RDD[(Long,Array[Long],Double,Boolean,SparseVector)]],
+                                classOf[RDD[Edge[Int]]]
+                                ))
     val spark = SparkSession.builder()
-          .config("spark.sql.shuffle.partitions", 1000)
+          .config(conf)
           .appName(s"BigClam").getOrCreate()
     import spark.implicits._
     val sc=spark.sparkContext
     val hadoopConf = spark.sparkContext.hadoopConfiguration
     @transient
     val fs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
+    val edgerdd=spark.read.textFile(graphpath).filter(!_.contains("#")).map(_.split("\t")).distinct.map(r=>(r(0).toLong,r(1).toLong)).rdd.persist(StorageLevel.MEMORY_ONLY_SER)
 
-    //for simple data
-    //alert!!!所有的节点id最好是紧凑的格式，例如id为0~max(num_node)-1的形式,这样能最大化减少运行中的内存占用
-    val edgerdd=spark.read.textFile(graphpath).filter(!_.contains("#")).map(_.split("\t")).distinct.map(r=>(r(0).toLong,r(1).toLong)).rdd.persist()
     val edges=edgerdd.map(e => Edge(e._1,e._2, 1L))
     val defaultvalue=""
-    val G=Graph.fromEdges(edges,defaultvalue)
+    val G=Graph.fromEdges(edges,defaultvalue,StorageLevel.MEMORY_ONLY_SER,StorageLevel.MEMORY_ONLY_SER)
   
+
+    
+    
+    //var F:RDD[(Long,BDM[Double])] = _
+    
     val epsCommForce = 1e-6
     
-    val collectNeighbor = G.ops.collectNeighborIds(EdgeDirection.Either).map{case(id,attr)=>(id,attr)}.persist()
-    val EgoNeighbor = collectNeighbor.map(x =>(x._1,Array(x._1)++x._2))
+    //构造Neightborbc,key为节点,value为节点对应的邻居
+
+    val collectNeighbor = G.ops.collectNeighborIds(EdgeDirection.Either).map{case(id,attr)=>(id,attr)}.persist(StorageLevel.MEMORY_ONLY_SER)
+
+
+    //构Neightborhoodbc,key为节点，value为节点对应的邻居以及节点本身
+    def getEgoGraphNodes(): RDD[(VertexId, Array[VertexId])]={
+        return collectNeighbor.map(x =>(x._1,Array(x._1)++x._2))
+    }
+    val Neightborhoodbc = collectNeighbor.map(x =>(x._1,Array(x._1)++x._2))
 
     def aggregatorForTag(a: (Array[Long], Array[Long]), b: (Array[Long], Array[Long])): (Array[Long], Array[Long]) = {                                    
          ((a._1++b._1).distinct,(a._2++b._2))
     }
 
+    
     def aggregatorForMinimal(a: Double, b: Double): Double = {                                    
              if(a<=b)
 	     {
@@ -245,17 +547,21 @@ def run(graphpath:String):Unit={
 
     def conductanceLocalMin(): Array[Long]={
             // compute conductance for all nodes
-            val egonet=EgoNeighbor
+            val egonet=Neightborhoodbc
             val sigmaDegres = sc.broadcast((G.inDegrees ++ G.outDegrees).reduceByKey(_+_).map(_._2).reduce(_+_))           
+            //将egonet中的(x,neigh(x))展开为(x,n1),(x,n2),(x,n2)
+            //等价于将edges反过来和原来的union，并且加上连接上自身的边
             val outedges=edgerdd.map(e => (e._1,e._2))
             val inedges=edgerdd.map(e => (e._2,e._1))
             val selfedges=G.vertices.map{case(id,attr)=>id}.map(x=>(x,x))
             val egonetedges=outedges.union(inedges).union(selfedges).toDF("fromnode","node")
 
+            //将egonetedges和collectNeighbor进行join，找到二阶邻居
             val onedegreeneigh=collectNeighbor.toDF("node","neigharray")
+            
             val twodegreeneigh=egonetedges.join(onedegreeneigh,egonetedges("node")===onedegreeneigh("node")).toDF("fromnode","tonode","tonode1","neigharray").select("fromnode","tonode","neigharray").map(r=>(r.getLong(0),(Array(r.getLong(1)),r.getAs[Seq[Long]](2).toArray))).rdd
 
-            //to make (x,1neigh(x),2neigh(x))
+             //通过reducebykey聚合(x,1neigh(x),2neigh(x))
             val oneandtwoneigh=twodegreeneigh.reduceByKey(aggregatorForTag) 
             val ConductanceRDD =oneandtwoneigh.map{case(x,(y,z))=>
               var cut_S = z.map(i => if(y.contains(i)) 0.0 else 1.0).filter(m => m == 1.0).size;
@@ -265,41 +571,41 @@ def run(graphpath:String):Unit={
             }
          
             val ConductanceDF=ConductanceRDD.toDF("node","conducu")
+           
 	        val alledges=outedges.union(inedges).toDF("fromnode","node") 
             val minimal_1=alledges.join(ConductanceDF,alledges("node")===ConductanceDF("node")).toDF("node","tonode","node1","dstconducu").select("node","tonode","dstconducu")
 	        val minimal_2=minimal_1.join(ConductanceDF,minimal_1("node")===ConductanceDF("node")).toDF("fromnode","tonode","dstconducu","node1","srcconducu").select("fromnode","tonode","dstconducu","srcconducu")
-	        //TODO,i am not sure which method is correct
+	        //TODO，以下两种算法不清楚哪种对
 	        //method 1
 	        val indx=minimal_2.map(r=>((r.getLong(0),r.getDouble(3)),r.getDouble(2))).rdd.reduceByKey(aggregatorForMinimal).filter{case ((x,y),z)=>y<=z}.map{case ((x,y),z)=>x}.collect.distinct
 
 	        //method 2
 	        //val indx=minimal_2.map(r=>(r.getLong(0),(r.getDouble(2),r.getLong(1)))).rdd.reduceByKey(NeighMinimal).map(_._2._2).collect.distinct
+       
             sigmaDegres.destroy()
             return indx
     }
 
     
+    val Array(trainrdd,testrdd) = edgerdd.randomSplit(Array(0.8, 0.2))
     var uset = G.vertices.map(_._1).collect.toList
-    var S = conductanceLocalMin()
+   
+    var S=conductanceLocalMin()
     
-    //kvalue need to be less than S.size
-    var kvalue=100
+    
+    var kvalue=S.size
     val vcount=uset.size
     println("kvalue: " + kvalue)
     println("S.size: " + S.size)
     println("uset: " + vcount)
     
-    def randomIndexedRow(index:Long,n : Int ):IndexedRow={
-        IndexedRow(index.toLong,Vectors.dense(Array.fill(n)(Random.nextInt(2).toDouble)).toSparse)
-    }
 
-
-    //to init the cluster-affilation matrix,c2n uses cluster as row and node as column,and n2c use nodes as row,cluster as column
+    //初始化node和cluster之间的二部图矩阵F
     def initNeighborComF(): DataFrame={
             // Get S set which is conductance of locally minimal
             val sinx=sc.broadcast(S.zipWithIndex.toMap)
-
-            val columnselect=collectNeighbor.map(x=>{
+            //求解以node id为index，node id和各个cluster连接的权重矩阵
+            val columnselect=Neightborhoodbc.map(x=>{
                     var ind=x._2.filter(r=>S.contains(r)).distinct.map(r=>sinx.value(r)).sorted;
                     var addColumn:SparseVector = null
                     if(S.size < kvalue)
@@ -312,27 +618,24 @@ def run(graphpath:String):Unit={
                     }
                     if(addColumn!=null)
                     {
-                        val addinx=addColumn.indices
-                        addinx.map(x=>x+S.size)
+                        val addinx=addColumn.indices.map(x=>x+S.size)
                         ind=ind ++ addinx
                     }
                     var value=Array.fill(ind.size)(1.0);
                     val y=new SparseVector(kvalue, ind, value);
                     (x._1,y)}).toDF("node","vector")
-            
 
             sinx.destroy()
             columnselect
      }
-     val n2c:DataFrame=initNeighborComF
+     val n2c=initNeighborComF
      collectNeighbor.unpersist()
-    
-     val Array(trainrdd,testrdd) = edgerdd.randomSplit(Array(0.8, 0.2))
-     //change the kvalue to see the variants of value,select the kvalue which makes value biggest
-     var (finalmatrix:DataFrame,value:Double)=Optimize(kvalue,n2c,trainrdd,testrdd,S,uset,spark)
-     edgerdd.unpersist()
+     G.unpersist()
+     var (finalmatrix:DataFrame,value:Double)=Optimize(kvalue,n2c,trainrdd,testrdd,spark)
 
-    //print the best result 
+     edgerdd.unpersist()
+    
+    //比较不同kvalue下的value大小，取最大的value对应的k，以及F作为分类的结果,这里省略
      val F=finalmatrix
      var e = 2.0*G.collectEdges(EdgeDirection.Either).count/(G.vertices.count*(G.vertices.count - 1))
      e = math.sqrt(-math.log(1-e))
@@ -346,7 +649,11 @@ def run(graphpath:String):Unit={
              Vectors.dense(x._2.map(value =>if (value>=e) 1.0 else 0.0)).toSparse.indices
              })
      }
-     Com.flatMap{case(x,y) => y.map(c => (c,x))}.rdd.groupByKey().coalesce(100).saveAsTextFile("/tmp/bigclam/kq-youhua.txt")
+     def aggfornodes(a: Array[Long], b: Array[Long]): Array[Long] = {                                    
+         a++b
+     }
+     val outputpath="/tmp/kq-youhua-pregel-k"+kvalue
+     Com.flatMap{case(x,y) => y.map(c => (c,Array(x)))}.rdd.reduceByKey(aggfornodes).coalesce(100).map(x=>(x._1,x._2.mkString(","))).saveAsTextFile(outputpath)
 
   }
 

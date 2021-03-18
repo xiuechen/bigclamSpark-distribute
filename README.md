@@ -18,8 +18,8 @@ Important Notices of the code:
 
 2.In Bigclam.scala,the nodeid need to be in range(0~max(num_nodes)-1),where num_nodes means the number of distinct nodes in the graph file
 
-3.use BigclamPregel which is much much faster
-4.sbt assembly to compile the program 
+3.use sbt assembly to compile the program 
+
 
 
 
